@@ -1,0 +1,1565 @@
+---
+title: "JD Carnus telo analyses on presence/absence Carnus"
+output: html_notebook
+---
+
+*Original author: Elisa Perez Badas*
+
+*Edited by: Elisa Perez Badas*
+
+*Created: December 2020*
+
+*Last updated: September 2023 after Mol Ecol minor revision*
+
+```{r packages and functions}
+library(lme4) 
+library(optimx)
+library(MuMIn)
+library(blme)
+library(lmerTest) 
+library(pbkrtest) 
+library(car)
+library(lmtest)
+library(psych)
+library(lattice)  
+library(arm)     
+library(phia)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pROC)
+library(insight)
+library(RVAideMemoire)
+library(merTools)
+library(TMB) 
+library(bbmle)
+library(smplot2)
+library(ggpubr)
+library(emmeans)
+
+##
+vif.mer <- function (fit) {
+  ## adapted from rms::vif
+  v <- vcov(fit)
+  nam <- names(fixef(fit))
+  ## exclude intercepts
+  ns <- sum(1 * (nam == "Intercept" | nam == "(Intercept)"))
+  if (ns > 0) {
+    v <- v[-(1:ns), -(1:ns), drop = FALSE]
+    nam <- nam[-(1:ns)]
+  }
+  d <- diag(v)^0.5
+  v <- diag(solve(v/(d %o% d)))
+  names(v) <- nam
+  v
+}
+##
+##
+overdisp_fun <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model,type="pearson")
+  Pearson.chisq <- sum(rp^2)
+  prat <- Pearson.chisq/rdf
+  pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+  c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+##
+##
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    library(plyr)
+
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+##
+##
+normDataWithin <- function(data=NULL, idvar, measurevar, betweenvars=NULL,
+                           na.rm=FALSE, .drop=TRUE) {
+    library(plyr)
+
+    # Measure var on left, idvar + between vars on right of formula.
+    data.subjMean <- ddply(data, c(idvar, betweenvars), .drop=.drop,
+     .fun = function(xx, col, na.rm) {
+        c(subjMean = mean(xx[,col], na.rm=na.rm))
+      },
+      measurevar,
+      na.rm
+    )
+
+    # Put the subject means with original data
+    data <- merge(data, data.subjMean)
+
+    # Get the normalized data in a new column
+    measureNormedVar <- paste(measurevar, "_norm", sep="")
+    data[,measureNormedVar] <- data[,measurevar] - data[,"subjMean"] +
+                               mean(data[,measurevar], na.rm=na.rm)
+
+    # Remove this subject mean column
+    data$subjMean <- NULL
+
+    return(data)
+}
+##
+##
+summarySEwithin <- function(data=NULL, measurevar, betweenvars=NULL, withinvars=NULL,
+                            idvar=NULL, na.rm=FALSE, conf.interval=.95, .drop=TRUE) {
+
+  # Ensure that the betweenvars and withinvars are factors
+  factorvars <- vapply(data[, c(betweenvars, withinvars), drop=FALSE],
+    FUN=is.factor, FUN.VALUE=logical(1))
+
+  if (!all(factorvars)) {
+    nonfactorvars <- names(factorvars)[!factorvars]
+    message("Automatically converting the following non-factors to factors: ",
+            paste(nonfactorvars, collapse = ", "))
+    data[nonfactorvars] <- lapply(data[nonfactorvars], factor)
+  }
+
+  # Get the means from the un-normed data
+  datac <- summarySE(data, measurevar, groupvars=c(betweenvars, withinvars),
+                     na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Drop all the unused columns (these will be calculated with normed data)
+  datac$sd <- NULL
+  datac$se <- NULL
+  datac$ci <- NULL
+
+  # Norm each subject's data
+  ndata <- normDataWithin(data, idvar, measurevar, betweenvars, na.rm, .drop=.drop)
+
+  # This is the name of the new column
+  measurevar_n <- paste(measurevar, "_norm", sep="")
+
+  # Collapse the normed data - now we can treat between and within vars the same
+  ndatac <- summarySE(ndata, measurevar_n, groupvars=c(betweenvars, withinvars),
+                      na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Apply correction from Morey (2008) to the standard error and confidence interval
+  #  Get the product of the number of conditions of within-S variables
+  nWithinGroups    <- prod(vapply(ndatac[,withinvars, drop=FALSE], FUN=nlevels,
+                           FUN.VALUE=numeric(1)))
+  correctionFactor <- sqrt( nWithinGroups / (nWithinGroups-1) )
+
+  # Apply the correction factor
+  ndatac$sd <- ndatac$sd * correctionFactor
+  ndatac$se <- ndatac$se * correctionFactor
+  ndatac$ci <- ndatac$ci * correctionFactor
+
+  # Combine the un-normed means with the normed results
+  merge(datac, ndatac)
+}
+```
+
+
+## calculating coef of variation for control sample
+
+Gels I used for this dataset are: 
+"65"  "66"  "67"  "68"  "69"  "70"  "71"  "72"  "73"  "74" "75"  "76"  "77"  "78"  "81"  "82"  "83"  "84"  "87"  "88" "89"  "90"  "91"  "92"  "97"  "100" "101" "102" "103" "104" "105" "106" "107" "108"
+
+
+```{r coef var}
+str(LanesToID)
+LanesToID[,c(1,3,4,5)] <- lapply(LanesToID[,c(1,3,4,5)], factor)
+LanesToIDb <- LanesToID %>% 
+  filter(GelId %in% c("65",  "66" , "67",  "68" , "69" , "70",  "71",  "72",  "73"  ,"74", "75",  "76",  "77" , "78" , "81" , "82",  "83" , "84" , "87" , "88", "89",  "90" , "91" , "92",  "97" , "100" ,"101", "102", "103", "104", "105" ,"106", "107" ,"108")) %>% 
+  filter(CatchID %in% c("3433")) %>% 
+  droplevels()
+str(LanesToIDb)
+
+str(GelData)
+GelData[,c(2,4)] <- lapply(GelData[,c(2,4)], factor)
+GelDatab <- GelData[,c(2:4,6)]
+
+LanesToIDc <- left_join(LanesToIDb,GelDatab,by=c("GelId","GelDate","Lane"))
+str(LanesToIDc)
+(sd(LanesToIDc$Average)/mean(LanesToIDc$Average))*100
+# 6.00764
+
+```
+
+
+## CARNUS EFFECTS ON TELO
+
+# Model: all interactions 
+
+
+```{r model 3 only 2 way interactions}
+
+#need to scale mass per age group
+
+JDcarnusBROODlargeDATASET2d5<-subset(JDcarnusBROODlargeDATASET326, day=="5")
+JDcarnusBROODlargeDATASET2d5$scaledMASSd5 <- scale(JDcarnusBROODlargeDATASET2d5$mass)
+JDcarnusBROODlargeDATASET2d5 <- JDcarnusBROODlargeDATASET2d5[,c(1,3,20,27)]
+JDcarnusBROODlargeDATASET2<-left_join(JDcarnusBROODlargeDATASET326, JDcarnusBROODlargeDATASET2d5, by = c("Chick_ID", "Fnest","day"))
+
+JDcarnusBROODlargeDATASET2d30<-subset(JDcarnusBROODlargeDATASET326, day=="30")
+JDcarnusBROODlargeDATASET2d30$scaledMASSd30 <- scale(JDcarnusBROODlargeDATASET2d30$mass)
+JDcarnusBROODlargeDATASET2d30 <- JDcarnusBROODlargeDATASET2d30[,c(1,3,20,27)]
+JDcarnusBROODlargeDATASET2<-left_join(JDcarnusBROODlargeDATASET2, JDcarnusBROODlargeDATASET2d30, by = c("Chick_ID", "Fnest","day"))
+
+JDcarnusBROODlargeDATASET2$scaledMASSagegroup <- ifelse(is.na(JDcarnusBROODlargeDATASET2$scaledMASSd5), JDcarnusBROODlargeDATASET2$scaledMASSd30, JDcarnusBROODlargeDATASET2$scaledMASSd5) 
+which(is.na(JDcarnusBROODlargeDATASET2$scaledMASSagegroup))
+JDcarnusBROODlargeDATASET2 <- JDcarnusBROODlargeDATASET2[,-c(27,28)]
+
+
+
+#creating dummy variables to center factors
+JDcarnusBROODlargeDATASET2$SEX01 <- ifelse(JDcarnusBROODlargeDATASET2$SEX== "f", 0, 1)
+JDcarnusBROODlargeDATASET2$ManipulationCategorie01 <- ifelse(JDcarnusBROODlargeDATASET2$ManipulationCategorie== "-1", 0, 1)
+JDcarnusBROODlargeDATASET2$CarnusYN_Fnest01<- ifelse(JDcarnusBROODlargeDATASET2$CarnusYN_Fnest== "N", 0, 1)
+JDcarnusBROODlargeDATASET2$Age01<- ifelse(JDcarnusBROODlargeDATASET2$day== 5, 0, 1)
+
+
+str(JDcarnusBROODlargeDATASET2) #652 obs
+
+#first get summary stats by group
+dfgrouped <- JDcarnusBROODlargeDATASET2 %>%
+  group_by(day,ManipulationCategorie) %>%
+  summarise(mean=mean(mass), sd=sd(mass))
+  
+#day ManipulationCategorie  mean    sd
+#  5                    -1  41.6  8.66
+#  5                     1  43.0  7.26
+
+#  30                   -1  230.  18.6 
+#  30                    1  228.  22.5 
+
+dfgrouped2 <- JDcarnusBROODlargeDATASET2 %>%
+  group_by(day,ManipulationCategorie, SEX) %>%
+  summarise(mean=mean(mass), sd=sd(mass))
+
+#day   ManipulationCategorie SEX    mean    sd
+#5     -1                    f      42.3  8.17
+#5     -1                    m      41.1  9.15
+
+#5     1                     f      43.5  7.04
+#5     1                     m      42.5  7.52
+
+#30    -1                    f     219.  13.9 
+#30    -1                    m     241.  16.1 
+
+#30    1                     f     219.  16.6 
+#30    1                     m     236.  24.3 
+
+JDcarnusBROODlargeDATASET2[,c(1:6,8:10,16,17,20)] <- lapply(JDcarnusBROODlargeDATASET2[,c(1:6,8:10,16,17,20)], factor)
+
+#variable to scale mass per manip group too
+scaled_df <- JDcarnusBROODlargeDATASET2%>%
+              group_by(day,ManipulationCategorie) %>%
+                  mutate(scaledmass_agemanip = scale(mass))
+
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+
+##model has been changed to work out why coefficient for Carnus changes from -60 to -11
+
+mteloFINAL <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup+scaledMASSagegroup:scale(Age01, scale=F)+scaledMASSagegroup:scale(SEX01, scale=F)+scaledMASSagegroup:scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup:scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup:scale(CarnusYN_Fnest01,scale=F)+scaledMASSagegroup:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=JDcarnusBROODlargeDATASET2, control=my.control)
+# no singular fit error
+
+sjPlot::tab_model(mteloFINAL, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Brood manipulation",
+                                          "Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex","Carnus presence*Brood manipulation","Age*Brood manipulation", "Brood manipulation*Sex","Age*Scaled mass per age group", "Scaled mass per age group*Sex","Scaled mass per age group*Brood manipulation","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Brood manipulation*Carnus presence", "Carnus presence*Brood manipulation*Sex","Age*Brood manipulation*Sex","Age*Brood manipulation*Scaled mass per age group","Age*Carnus presence*Scaled mass per age group", "Age*Carnus presence*Brood manipulation*Sex"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwOUTLIER.doc")
+
+```
+
+
+```{r anova model 3}
+Anova(mteloFINAL, type=3, test="F")
+```
+
+
+
+
+```{r summary model 3}
+summary(mteloFINAL, ddf="Kenward-Roger")
+```
+
+
+
+```{r CI final model}
+confint.fixed <- confint.merMod(mteloFINAL, parm="beta_", level=0.95,
+method="boot", boot.type="perc", nsim=1000)
+print(confint.fixed, digits=3)
+```
+
+# model without outlier
+
+
+```{r model w/0 outlier}
+
+## removing individual that had v high telo short, see graph section
+which(JDcarnusBROODlargeDATASET2$Chick_ID=="TY1505A") # 216 542
+JDcarnusBROODlargeDATASET2bis <- JDcarnusBROODlargeDATASET2[-c(216,542),]
+
+str(JDcarnusBROODlargeDATASET2bis) #650 obs, 325 ind
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+
+
+
+mteloFINALbis <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup+scaledMASSagegroup:scale(Age01, scale=F)+scaledMASSagegroup:scale(SEX01, scale=F)+scaledMASSagegroup:scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup:scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+scaledMASSagegroup:scale(CarnusYN_Fnest01,scale=F)+scaledMASSagegroup:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)++(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=JDcarnusBROODlargeDATASET2bis, control=my.control)
+# no singular fit error
+
+# 644 obs, 322 ind
+
+sjPlot::tab_model(mteloFINALbis, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Brood manipulation",
+                                          "Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex","Carnus presence*Brood manipulation","Age*Brood manipulation", "Brood manipulation*Sex","Age*Scaled mass per age group", "Scaled mass per age group*Sex","Scaled mass per age group*Brood manipulation","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Brood manipulation*Carnus presence", "Carnus presence*Brood manipulation*Sex","Age*Brood manipulation*Sex","Age*Brood manipulation*Scaled mass per age group","Age*Carnus presence*Scaled mass per age group", "Age*Carnus presence*Brood manipulation*Sex"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIER.doc")
+
+```
+
+
+# FINAL FINAL model with and without outlier and scaled mass by age group and manip
+
+```{r model w outlier scaled mass by age group and manip}
+scaled_df <- as.data.frame(scaled_df)
+
+mteloFINALb <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_df, control=my.control)
+# no singular fit error
+
+sjPlot::tab_model(mteloFINALb, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Brood manipulation",
+                                          "Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex","Carnus presence*Brood manipulation","Age*Brood manipulation", "Brood manipulation*Sex","Age*Scaled mass per age group", "Scaled mass per age group*Sex","Scaled mass per age group*Brood manipulation","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Brood manipulation*Carnus presence", "Carnus presence*Brood manipulation*Sex","Age*Brood manipulation*Sex","Age*Brood manipulation*Scaled mass per age group","Age*Carnus presence*Scaled mass per age group", "Age*Carnus presence*Brood manipulation*Sex"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwOUTLIERscaledmassmanip.doc")
+
+```
+
+```{r model d5 only}
+
+mteloFINALbisbd5 <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=scaled_dfbisd5, control=my.control)
+
+sjPlot::tab_model(mteloFINALbisbd5,
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERscaledmassmanipD5.doc")
+```
+
+```{r model d30 only}
+scaled_dfbisd30 <- scaled_dfbis %>% 
+  filter(day =="30") %>% 
+  droplevels()
+mteloFINALbisbd30 <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=scaled_dfbisd30, control=my.control)
+
+sjPlot::tab_model(mteloFINALbisbd30,
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERscaledmassmanipD30.doc")
+```
+
+```{r model w/0 outlier scaled mass by age group and manip}
+
+## removing individual that had v high telo short, see graph section
+which(scaled_df$Chick_ID=="TY1505A") # 216 542
+scaled_dfbis <- scaled_df[-c(216,542),]
+
+scaled_dfbis <- scaled_dfbis22[,-1]
+scaled_dfbis[,c(1:6,8:10,16,17,20,33:36,38,40)] <- lapply(scaled_dfbis[,c(1:6,8:10,16,17,20,33:36,38,40)], factor)
+str(scaled_dfbis) #650 obs, 325 ind
+
+#after running the model it will be 322 because there are 3 missing sex
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+mteloFINALbisb <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbis, control=my.control)
+# no singular fit error
+
+# 644 obs, 322 ind
+
+
+
+summary(scaled_dfbis$CarnusYN_Fnest)
+## N    Y 
+## 88 562 
+
+scaled_dfbisd5 <- scaled_dfbis %>% 
+  filter(day =="5") %>% 
+  droplevels()
+str(scaled_dfbisd5)
+which(is.na(scaled_dfbisd5$SEX))
+scaled_dfbisd5 <- scaled_dfbisd5[-c(2,80,83),]
+
+summary(scaled_dfbisd5$CarnusYN_Fnest)
+##N   Y 
+##44 281  
+
+infNESTS <- scaled_dfbisd5[,c(3,5)]
+str(infNESTS)
+infNESTS <- unique(infNESTS) ## 175 nests
+summary(infNESTS$CarnusYN_Fnest)
+##N   Y 
+## 33 143
+summary(infNESTS$ManipulationCatFACT2)
+## enlarged  reduced 
+## 103 73 
+
+table(scaled_dfbisd5$CarnusYN_Fnest,scaled_dfbisd5$ManipulationCatFACT2)
+#     1   -1
+# N   15  29
+# Y   206 75
+
+chisq.test(scaled_dfbisd5$CarnusYN_Fnest,scaled_dfbisd5$ManipulationCatFACT2, correct=F)
+#X-squared = 26.891, df = 1, p-value = 2.153e-07
+
+chisq.test(scaled_dfbisd5$CarnusYN_Fnest,scaled_dfbisd5$YEAR, correct=F)
+#X-squared = 13.021, df = 5, p-value = 0.02319
+
+sjPlot::tab_model(mteloFINALbisb, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Brood manipulation",
+                                          "Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex","Carnus presence*Brood manipulation","Age*Brood manipulation", "Brood manipulation*Sex","Age*Scaled mass per age group", "Scaled mass per age group*Sex","Scaled mass per age group*Brood manipulation","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Brood manipulation*Carnus presence", "Carnus presence*Brood manipulation*Sex","Age*Brood manipulation*Sex","Age*Brood manipulation*Scaled mass per age group","Age*Carnus presence*Scaled mass per age group", "Age*Carnus presence*Brood manipulation*Sex"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERscaledmassmanip.doc")
+
+```
+
+
+```{r CI final model wo OUTLIER scaled mass by age and manip}
+confint.fixed <- confint.merMod(mteloFINALbisb, parm="beta_", level=0.95,
+method="boot", boot.type="perc", nsim=1000)
+# gives singular fit message for 546 models
+
+#starts at 18:33, checked next morning, unsure when it ended
+print(confint.fixed, digits=3)
+```
+
+
+
+```{r correting manip category and redoing model THIS IS THE MODEL IN THE MS}
+
+NEST[,c(1,2)] <- lapply(NEST[,c(1,2)], factor)
+NESTmanip <- NEST[,c(2,16)] 
+str(NESTmanip) #1473 obs
+colnames(NESTmanip) <- c("Fnest", "ManipulationCatCORR2")
+
+scaled_dfbis[,c(1:6,8,16,17,33:36,38)] <- lapply(scaled_dfbis[,c(1:6,8,16,17,33:36,38)], factor)
+
+scaled_dfbis2<-left_join(scaled_dfbis, NESTmanip, by = c("Fnest")) ### correction was ok
+
+##import corr table
+scaled_dfbis22 <- scaled_dfbis22[,-1]
+
+scaled_dfbis22[,c(1:6,8,16,17,33:36,38,40)] <- lapply(scaled_dfbis22[,c(1:6,8,16,17,33:36,38,40)], factor)
+str(scaled_dfbis22) #650 obs. 
+## checking individual that had v high telo short was removed, see graph section
+which(scaled_dfbis22$Chick_ID=="TY1505A") # 0
+
+str(scaled_dfbis22) #650 obs, 325 ind
+
+#after running the model it will be 322 because there are 3 missing sex
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+mteloFINALbisbb <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)*scale(ManipulationCatCORR2, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(ManipulationCatCORR2, scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(ManipulationCatCORR2, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbis22, control=my.control)
+# no singular fit error
+
+# 644 obs, 322 ind
+
+scaled_dfbisd5 <- scaled_dfbis22 %>% 
+  filter(day =="5") %>% 
+  droplevels()
+str(scaled_dfbisd5)
+which(is.na(scaled_dfbisd5$SEX))
+scaled_dfbisd5 <- scaled_dfbisd5[-c(2,80,83),]
+
+summary(scaled_dfbisd5$CarnusYN_Fnest)
+##N   Y 
+##44 278  
+
+infNESTS <- scaled_dfbisd5[,c(3,5)]
+str(infNESTS)
+infNESTS <- unique(infNESTS) ## 175 nests
+summary(infNESTS$CarnusYN_Fnest)
+##N   Y 
+## 33 142
+
+table(scaled_dfbis$CarnusYN_Fnest,scaled_dfbis$ManipulationCatCORR)
+#     -1   1
+# N   62  26
+# Y   130 432
+
+chisq.test(scaled_dfbis$CarnusYN_Fnest,scaled_dfbis$ManipulationCatCORR, correct=F)
+#X-squared = 81.867, df = 1, p-value < 2.2e-16
+
+vif.mer(mteloFINALbisbb)
+
+##getting sample sizes for replicates
+names(scaled_dfbisd5)
+dfREPL <- subset(scaled_dfbisd5, select=c("CarnusYN_Fnest01","Age01","SEX01","ManipulationCatFACT2","scaledmass_agemanip","YEAR","Colony","GelID","Fnest"))
+dfREPL<-dfREPL[complete.cases(dfREPL[,1:9]),]
+dfREPL2 <- subset(dfREPL, select=c("ManipulationCatFACT2","Fnest"))
+dfREPL2 <- unique(dfREPL2) ## 175 nests
+str(dfREPL2)
+summary(dfREPL2$ManipulationCatFACT2)
+## enlarged  reduced 
+##     102       73 
+
+dfREPL3 <- subset(dfREPL, select=c("ManipulationCatFACT2","Colony", "Fnest", "YEAR"))
+dfREPL3 <- unique(dfREPL3) ## 195 obs originally so need to import corrected colony names bc colony was both foster and incub nest and this is why it gave more N; now corrected so it gives N=175 nests
+dfREPL3[,c(1:4)] <- lapply(dfREPL3[,c(1:4)], factor)
+str(dfREPL3)
+table(dfREPL3$ManipulationCatFACT2, dfREPL3$COLONY2)
+##         AW BS BW KS LW OS SW TY ZW
+##enlarged  7  0 20  1 26  5 13 28  2
+##reduced   9  1  4  1 25  2 16 15  0
+ 
+##         AW BS BW LW OS SW TY 
+##enlarged  7  3 20 26  5 13 28 
+##reduced   9  2  4 25  2 16 15 
+
+dfREPL4 <- subset(dfREPL, select=c("ManipulationCatFACT2","YEAR", "Fnest"))
+dfREPL4 <- unique(dfREPL4) ## 175 nests
+str(dfREPL4)
+table(dfREPL4$ManipulationCatFACT2, dfREPL4$YEAR)
+##         2012 2013 2014 2015 2016 2017
+##enlarged    3    7   32   23   22   15
+##reduced     0    6   20   17   18   12
+ 
+
+
+sjPlot::tab_model(mteloFINALbisbb, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Brood manipulation",
+                                          "Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex","Carnus presence*Brood manipulation","Age*Brood manipulation", "Brood manipulation*Sex","Age*Scaled mass per age group", "Scaled mass per age group*Sex","Scaled mass per age group*Brood manipulation","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Brood manipulation*Carnus presence", "Carnus presence*Brood manipulation*Sex","Age*Brood manipulation*Sex","Age*Brood manipulation*Scaled mass per age group","Age*Carnus presence*Scaled mass per age group", "Age*Carnus presence*Brood manipulation*Sex"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERscaledmassmanip.doc")
+```
+
+
+```{r CI final model wo OUTLIER corr manip cat}
+confint.fixed <- confint.merMod(mteloFINALbisbb, parm="beta_", level=0.95,
+method="boot", boot.type="perc", nsim=1000)
+
+#runs in 2 min
+# 547 models were gave singular fit warning
+print(confint.fixed, digits=3)
+```
+# emmeans
+
+```{r emmeans FINAL MODEL}
+
+#need to run another model with factors for emmeans to work
+
+mteloFINALbisFACT <- lmer(TELOaverage ~day*SEX*CarnusYN_Fnest*ManipulationCatFACT2+scaledMASSagegroup+scaledMASSagegroup:day+scaledMASSagegroup:SEX+scaledMASSagegroup:ManipulationCatFACT2+scaledMASSagegroup:CarnusYN_Fnest+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbis22, control=my.control)
+# no singular fit error
+
+
+emms1 <- emmeans(mteloFINALbisFACT, pairwise ~ day*CarnusYN_Fnest| ManipulationCatFACT2)
+emms1
+```
+
+```{r table and graph from emmeans}
+
+day <- c("5", "30", "5","30","5","30","5","30")
+Carnus<- c("N","N","Y","Y","N","N","Y","Y")
+telo <- c(7297,7165,7146,6864,7014,6747,7093,6831)
+lowerCI <- c(6961,6828,6943,6661,6748,6480,6876,6615)
+upperCI<-c(7633,7501,7348,7066,7280,7013,7309,7048)
+manip <- c("enlarged","enlarged","enlarged","enlarged","reduced","reduced","reduced","reduced")
+bubba <- data.frame(day,Carnus,telo, lowerCI, upperCI,manip)
+
+bubba$day <- as.factor(bubba$day)
+levels(bubba$day)
+bubba$day <- factor(day, levels = c("5", "30"))
+
+levels(bubba$manip)
+bubba$manip <- factor(manip, levels = c("reduced", "enlarged"))
+
+pd <- position_dodge(0.4)
+
+p<-ggplot(bubba, aes(x=day, y=telo,group=Carnus)) + 
+    geom_line(aes(group=Carnus, linetype=Carnus), size=1,position=pd)+ 
+  geom_errorbar(width=0.6,size=1,(aes(ymax=upperCI, ymin=lowerCI)), colour="black",position=pd)+
+  geom_point(aes(x=day,y=telo), shape=21, fill="black", colour="black", size=5,data=subset(bubba,manip=="enlarged"),position=pd)+
+  geom_point(aes(x=day,y=telo), shape=21, fill="white", colour="black", size=5,data=subset(bubba,manip=="reduced"),position=pd)+
+  facet_wrap(~manip)+
+  labs(x="Age (days)",y="Telomere length (bp)") +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(20,0,30,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,20,0,30)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.key.size = unit(0.5, "in"),#this makes legend bigger so dashed line can be seen
+        legend.text=element_text(size=22),
+        legend.title=element_text(size=22),
+        strip.background =element_rect(fill="gray93"), #background colour in facet wrap
+        strip.text = element_text(size = 22)) # this makes text in facet wrap bigger
+p 
+##
+##
+
+ggsave("emmeansAGEcarnusBROOD.png", width=22, height=32, unit="cm", dpi=600)
+##
+##
+
+
+```
+
+# checking shortening with age and parasites in reduced vs enlarged group
+```{r TS w age in reduced}
+summary(scaled_dfbis22$ManipulationCatFACT2)
+#enlarged  reduced 
+#     442      208 
+
+scaled_dfbisRED <- scaled_dfbis22 %>% 
+  filter(ManipulationCatFACT2 =="reduced") %>% 
+  droplevels()
+str(scaled_dfbisRED)
+
+summary(scaled_dfbisRED$CarnusYN_Fnest)
+##N   Y 
+##58 150  
+
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+mteloFINALred <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbisRED, control=my.control)
+# singular fit 
+
+mteloFINALred <- blmer(formula = TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbisRED,
+                      control=lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                           optimizer= "bobyqa", optCtrl=list(maxfun=1e9)),
+                      cov.prior = invwishart)
+
+summary(mteloFINALred)
+
+sjPlot::tab_model(mteloFINALred, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex", "Scaled mass per age group*Sex","Age*Scaled mass per age group","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Carnus presence*Scaled mass per age group"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERredONLY.doc")
+```
+
+```{r TS w age in enlarged}
+summary(scaled_dfbis22$ManipulationCatFACT2)
+#enlarged  reduced 
+#     442      208 
+
+scaled_dfbisENL <- scaled_dfbis22 %>% 
+  filter(ManipulationCatFACT2 =="enlarged") %>% 
+  droplevels()
+str(scaled_dfbisENL)
+
+summary(scaled_dfbisENL$CarnusYN_Fnest)
+##N   Y 
+##30 412  
+
+
+my.control <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="bobyqa", optCtrl=list(maxfun=100000))
+
+mteloFINALenl <- lmer(TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbisENL, control=my.control)
+# singular fit 
+
+mteloFINALenl <- blmer(formula = TELOaverage ~scale(CarnusYN_Fnest01, scale=F)*scale(Age01, scale=F)*scale(SEX01, scale=F)+scaledmass_agemanip+scaledmass_agemanip:scale(SEX01, scale=F)+scaledmass_agemanip:scale(Age01, scale=F)+scaledmass_agemanip:scale(CarnusYN_Fnest01,scale=F)+scaledmass_agemanip:scale(Age01, scale=F):scale(CarnusYN_Fnest01, scale=F)+(1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID), data=scaled_dfbisENL,
+                      control=lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                           optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)),
+                      cov.prior = invwishart)
+
+summary(mteloFINALenl)
+
+sjPlot::tab_model(mteloFINALenl, pred.labels = c("Intercept","Carnus presence", "Age","Sex","Scaled mass per age group","Age*Carnus presence","Carnus presence*Sex","Age*Sex", "Scaled mass per age group*Sex","Age*Scaled mass per age group","Scaled mass per age group*Carnus presence","Age*Carnus presence*Sex","Age*Carnus presence*Scaled mass per age group"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELO4wayALLCENTwoOUTLIERenlONLY.doc")
+```
+
+
+
+
+# FINAL MODEL separating within- and between-year Carnus effects on telo
+
+```{r separated model}
+## info on building deltaCarnus and AvgCarnus in "JD Carnus telo updated.Rmd"
+
+
+mCARNseparated <- lmer(formula = TELOaverage ~(AverageCarnus)+(deltaCarnus)+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+scale(Age01, scale=F)+
+                         scale(Age01, scale=F):AverageCarnus+
+                         scale(Age01, scale=F):deltaCarnus+
+                         scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+
+                       scale(Age01, scale=F):scale(SEX01, scale=F)+
+                         scale(Age01, scale=F):scaledMASSagegroup+
+                        (1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID),
+                        data=JDcarnusBROODlargeDATASET2bis,
+                        control=my.control)
+
+
+##
+##
+##
+summary(mCARNseparated)
+## 
+
+
+```
+
+```{r seoarated model table}
+sjPlot::tab_model(mCARNseparated, pred.labels = c("Intercept","Average Carnus", "delta Carnus","Brood manipulation","Sex","Scaled mass per age group", "Age",
+                                          "Age*Average Carnus ","Age*delta Carnus","Age*Brood manipulation", "Age*Sex","Age*Scaled mass per age group"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELOseparatedNESTED.doc")
+
+```
+
+
+
+
+```{r diff model}
+## info on building deltaCarnus and AvgCarnus in "JD Carnus telo updated.Rmd"
+
+
+mCARNdiff <- lmer(formula = TELOaverage ~(AverageCarnus)+CarnusYN_Fnest+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+scale(Age01, scale=F)+
+                         scale(Age01, scale=F):AverageCarnus+
+                         scale(Age01, scale=F):CarnusYN_Fnest+
+                         scale(Age01, scale=F):scale(ManipulationCategorie01, scale=F)+
+                       scale(Age01, scale=F):scale(SEX01, scale=F)+
+                         scale(Age01, scale=F):scaledMASSagegroup+
+                        (1|YEAR)+(1|Colony)+(1|Fnest/Chick_ID)+(1|GelID),
+                        data=JDcarnusBROODlargeDATASET2bis,
+                        control=my.control)
+
+
+##
+##
+##
+summary(mCARNdiff)
+## 
+
+
+```
+
+
+```{r diff model table}
+
+## the estimate for Average Carnus here is the diff between within
+## 
+
+sjPlot::tab_model(mCARNdiff, pred.labels = c("Intercept","Average Carnus", "Carnus presence","Brood manipulation","Sex","Scaled mass per age group", "Age",
+                                          "Age*average Carnus","Age*Carnus presence","Age*Brood manipulation", "Age*Sex","Age*Scaled mass per age group"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELOdiffmodelNESTED.doc")
+
+```
+
+
+
+```{r separated SHORTENING model}
+## info on building deltaCarnus and AvgCarnus in "JD Carnus telo updated.Rmd"
+
+str(JDcarnusBROODlargeDATASET2d30bis)
+
+mCARNseparatedTS <- lmer(formula = TELOshort ~(AverageCarnus)+(deltaCarnus)+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+
+                  (1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID),
+                        data=JDcarnusBROODlargeDATASET2d30bis,
+                        control=my.control)
+
+## singular fit
+
+mCARNseparatedTS <- blmer(formula = TELOshort ~(AverageCarnus)+(deltaCarnus)+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+
+                  (1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=JDcarnusBROODlargeDATASET2d30bis,
+                      control=lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                           optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)),
+                      cov.prior = invwishart)
+
+
+
+
+##
+##
+##
+summary(mCARNseparatedTS)
+## 
+
+
+```
+
+
+```{r separated SHORTENING model table}
+sjPlot::tab_model(mCARNseparatedTS, pred.labels = c("Intercept","Average Carnus", "delta Carnus","Brood manipulation","Sex","Scaled mass day 30"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELOSHORTseparatedNESTED.doc")
+
+```
+
+
+
+```{r diff SHORTENING model}
+## info on building deltaCarnus and AvgCarnus in "JD Carnus telo updated.Rmd"
+
+
+mCARNdiffTS <- lmer(formula = TELOshort ~(AverageCarnus)+CarnusYN_Fnest+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+
+                  (1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID),
+                        data=JDcarnusBROODlargeDATASET2d30bis,
+                        control=my.control)
+
+## singular fit
+
+mCARNdiffTS <- blmer(formula = TELOshort ~(AverageCarnus)+(CarnusYN_Fnest)+scale(ManipulationCategorie01, scale=F)+scale(SEX01, scale=F)+scaledMASSagegroup+
+                  (1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=JDcarnusBROODlargeDATASET2d30bis,
+                      control=lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                           optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)),
+                      cov.prior = invwishart)
+
+
+
+
+##
+
+
+```
+
+
+```{r diff SHORTENING model table}
+sjPlot::tab_model(mCARNdiffTS, pred.labels = c("Intercept","Average Carnus", "Carnus presence","Brood manipulation","Sex","Scaled mass day 30"),
+                  show.ci = F, show.se = T, show.r2=T, file = "~/Desktop/TELOSHORTdiffNESTED.doc")
+
+```
+
+
+
+
+## GRAPHS
+
+# Fig 1 TL mass relationship
+
+```{r corr plot telo mass}
+
+
+p <- ggscatter(JDcarnusBROODlargeDATASET2bis, x = "mass", y = "TELOaverage",
+          add = "reg.line",                         # Add regression line
+          conf.int = TRUE,                          # Add confidence interval
+          color = "day", palette = c("#000000", "#999999"),           # Color by groups "day"
+          shape = "day"                             # Change point shape by groups "day"
+          )+
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_text(vjust=0.5, size=14, hjust = 1,margin =margin(10,0,10,0)),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))+
+    labs(x="Mass",y="Telomere length (bp)") +
+    scale_x_continuous(limits = c(0, 300),breaks = c(20,50,80,110, 140,170,200,230,260,290))
+## above good graph, but better below
+
+
+p<-ggplot(scaled_dfbis, aes(x=mass, y=TELOaverage)) + 
+  geom_point(aes(shape=day), size=2) + 
+  facet_wrap(~day, scales="free_x")+
+  geom_smooth(method="lm",se = FALSE,
+              colour = "black") +
+    geom_ribbon(method="lm",stat = "smooth",
+              se = TRUE,
+              alpha = 0, # or, use fill = NA
+              colour = "black",
+              linetype = "dotted")+
+  labs(x="Mass (g)",y="Telomere length (bp)") +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=20),
+        axis.title.y = element_text(size=20, vjust=0.3),
+        axis.text.x=element_text(size=16,margin =margin(20,0,30,0)),
+        axis.text.y=element_text(size=16, margin =margin(0,20,0,30)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none",
+        strip.text = element_text(size = 18)) #this makes font size in facet wrap bigger
+p
+# if wanted to add correlation coefficient +stat_cor(aes(color = day), label.x = 90) 
+
+ggsave("telo mass correlation.png", width=34, height=28, unit="cm", dpi=600)
+
+```
+
+
+# preparing dataset for telo d5-d30 correlation Fig 2a
+
+```{r df graphs shortening}
+JDcarnusBROODlargeDATASET2 <- JDcarnusBROODlargeDATASET2[,-1]
+
+JDcarnusBROODlargeDATASET2d30<-subset(JDcarnusBROODlargeDATASET2, day=="30")
+JDcarnusBROODlargeDATASET2d5<-subset(JDcarnusBROODlargeDATASET2, day=="5")
+names(JDcarnusBROODlargeDATASET2d5)
+JDcarnusBROODlargeDATASET2d5 <- JDcarnusBROODlargeDATASET2d5[,c(1,3,18)]
+colnames(JDcarnusBROODlargeDATASET2d5) <- c("Chick_ID", "Fnest","TELOaveraged5")
+
+JDcarnusBROODlargeDATASET2d30 <- left_join(JDcarnusBROODlargeDATASET2d30,JDcarnusBROODlargeDATASET2d5, by=c("Chick_ID","Fnest"))
+names(JDcarnusBROODlargeDATASET2d30)
+
+JDcarnusBROODlargeDATASET2d30$TELOshort <- JDcarnusBROODlargeDATASET2d30$TELOaveraged5-JDcarnusBROODlargeDATASET2d30$TELOaverage
+range(JDcarnusBROODlargeDATASET2d30$TELOshort) # -373.6573 1357.4102
+summary(JDcarnusBROODlargeDATASET2d30$TELOshort) 
+which(JDcarnusBROODlargeDATASET2d30$TELOshort>700)
+JDcarnusBROODlargeDATASET2d30[216,1]
+
+
+## df w/o outlier
+
+JDcarnusBROODlargeDATASET2d30bis <- JDcarnusBROODlargeDATASET2d30[-216,]
+JDcarnusBROODlargeDATASET2d30bis<-subset(JDcarnusBROODlargeDATASET2bis, day=="30")
+JDcarnusBROODlargeDATASET2d5bis<-subset(JDcarnusBROODlargeDATASET2bis, day=="5")
+names(JDcarnusBROODlargeDATASET2d5bis)
+JDcarnusBROODlargeDATASET2d5bis <- JDcarnusBROODlargeDATASET2d5bis[,c(1,3,18)]
+colnames(JDcarnusBROODlargeDATASET2d5bis) <- c("Chick_ID", "Fnest","TELOaveraged5")
+
+JDcarnusBROODlargeDATASET2d30bis <- left_join(JDcarnusBROODlargeDATASET2d30bis,JDcarnusBROODlargeDATASET2d5bis, by=c("Chick_ID","Fnest"))
+names(JDcarnusBROODlargeDATASET2d30bis)
+
+summary(JDcarnusBROODlargeDATASET2d30bis$TELOshort)  
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# -373.7   185.5   278.9   263.8   359.7   697.8 
+
+
+```
+
+
+
+
+# Fig 2a telomere length correlation d5 d30
+
+```{r telomere length and open closed circles}
+#model to get lines
+names(JDcarnusBROODlargeDATASET2d30)
+dfGRAPH <- JDcarnusBROODlargeDATASET2d30[,c(5,27:31,18,8,9,3,6)]
+dfGRAPH<-dfGRAPH[complete.cases(dfGRAPH),] 
+str(dfGRAPH) # 323 obs
+
+modelGRAPH <- lmer(TELOaverage~TELOaveraged5*scale(CarnusYN_Fnest01, center=T)+scaledMASSagegroup+scale(SEX01, center=T)+scale(ManipulationCategorie01, center=T)+(1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=dfGRAPH, control=my.control)
+#Some predictor variables are on very different scales: consider rescalingboundary (singular) fit: see ?isSingular
+# same error with Nelder_Mead optimiser
+
+#                                                    Estimate Std. Error         df t value Pr(>|t|)
+#(Intercept)                                       -208.54657  126.08027  250.21247  -1.654  0.09937 .  
+#TELOaveraged5                                        0.99188    0.01730  293.59989  57.350  < 2e-16 ***
+#scale(CarnusYN_Fnest01, center = T)               -421.20371  140.03056  284.14262  -3.008  0.00287 ** 
+#scaledMASSagegroup                                 -20.27374   10.36895  312.13583  -1.955  0.05145 .  
+#scale(SEX01, center = T)                            10.33756   10.26655  303.64220   1.007  0.31478    
+#scale(ManipulationCategorie01, center = T)          16.05482    9.25924  298.83321   1.734  0.08396 .  
+#TELOaveraged5:scale(CarnusYN_Fnest01, center = T)    0.05593    0.01964  287.00036   2.847  0.00473 ** 
+
+
+
+my.control2 <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="Nelder_Mead", optCtrl=list(maxfun=100000))
+
+modelGRAPH2 <- blmer(formula = TELOaverage~TELOaveraged5+CarnusYN_Fnest01+scaledMASSagegroup+scale(SEX01, center=T)+scale(ManipulationCategorie01, center=T)+(1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=dfGRAPH,
+                        control=my.control2, #needs Nelder_Mead optimiser
+                        cov.prior = invwishart)
+
+#                                             Estimate Std. Error t value Pr(>|t|)
+#(Intercept)                                -193.65043  128.52572  -1.507 0.13188613
+#TELOaveraged5                                 0.99833    0.01746  57.174 0.00000000
+#CarnusYN_Fnest01                            -67.57260   27.33609  -2.472 0.01343899
+#scaledMASSagegroup                          -20.42796   10.57398  -1.932 0.05337071
+#scale(SEX01, center = T)                     10.03707   10.42240   0.963 0.33553319
+#scale(ManipulationCategorie01, center = T)   12.42955    9.25570   1.343 0.17930195
+
+parameters::p_value(modelGRAPH2)
+
+dfGRAPH$mpred <- predict(modelGRAPH2,newdata=dfGRAPH, type="response")
+range(dfGRAPH$mpred) ##5592.585 9460.462
+#but not using the predicted because this does not give parallel lines
+
+
+summary(JDcarnusBROODlargeDATASET2$CarnusYN_Fnest)
+#  N   Y 
+#  88 564 
+# 13.5% not infected
+# 86.5% infected
+
+dfabline <- JDcarnusBROODlargeDATASET2d30[,c(18,32)]
+dfabline$CarnusY <- (dfabline$TELOaverage)+193.65043+67.57260
+dfabline$CarnusN <- (dfabline$TELOaverage)+193.65043
+
+g0 <- ggplot(JDcarnusBROODlargeDATASET2d30,aes(x=TELOaveraged5,y=TELOaverage))+
+  geom_point(aes(x=TELOaveraged5,y=TELOaverage), shape=21, fill="grey", colour="black", size=2.5,data=subset(JDcarnusBROODlargeDATASET2d30,CarnusYN_Fnest=="Y"))+
+  geom_point(aes(x=TELOaveraged5,y=TELOaverage), shape=21,size=4, fill="white", data=subset(JDcarnusBROODlargeDATASET2d30,CarnusYN_Fnest=="N"))+
+  scale_y_continuous(limits = c(5200, 10000),breaks = c(5200,5600,6000,6400, 6800,7200,7600,8000,8400,8800,9200,9600,10000))+
+  scale_x_continuous(limits = c(5200, 10000),breaks = c(5200,5600,6000,6400, 6800,7200,7600,8000,8400,8800,9200,9600,10000))+
+  labs(x="Telomere length day 5 (bp)",y="Telomere length day 30 (bp)") +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=18,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=18, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.title = element_blank(),
+        strip.text.x = element_text(size = 16))
+g0 +geom_line(data=dfabline, aes(x=TELOaverage,y=TELOaverage), colour="red")+
+  geom_line(data=dfabline, aes(x=CarnusY,y=TELOaverage), linetype="dashed")+
+  geom_line(data=dfabline, aes(x=CarnusN,y=TELOaverage), linetype="solid")
+
+
+#previous graph had geom_abline removed and this added
+#    geom_smooth(data=dfGRAPH, aes(x=TELOaveraged5,y=mpred,linetype=CarnusYN_Fnest),method="lm", se = FALSE,size=1,span=2, colour="black", show.legend = FALSE)
+##
+##
+ggsave("telo d5 d30 Carnus parallel.png", width=28, height=28, unit="cm", dpi=600)
+
+
+
+
+
+
+
+######### correlation graph w/o outlier
+
+#model to get lines
+names(JDcarnusBROODlargeDATASET2d30bis)
+dfGRAPHb <- JDcarnusBROODlargeDATASET2d30bis[,c(5,27:32,18,8,9,3,6)]
+dfGRAPHb<-dfGRAPHb[complete.cases(dfGRAPHb),] 
+str(dfGRAPHb) # 322 obs
+
+
+
+my.control2 <- lmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+optimizer="Nelder_Mead", optCtrl=list(maxfun=100000))
+
+modelGRAPH2b <- blmer(formula = TELOaverage~TELOaveraged5+CarnusYN_Fnest01+scaledMASSagegroup+scale(SEX01, center=T)+scale(ManipulationCategorie01, center=T)+(1|YEAR)+(1|Colony)+(1|Fnest)+(1|GelID), data=dfGRAPHb,
+                        control=my.control2, #needs Nelder_Mead optimiser
+                        cov.prior = invwishart)
+
+#                                             Estimate Std. Error t value Pr(>|t|)
+#(Intercept)                                -169.94352  119.12735  -1.427 0.15370386
+#TELOaveraged5                                 0.99491    0.01614  61.632 0.00000000
+#CarnusYN_Fnest01                            -64.95461   25.26044  -2.571 0.01012893
+#scaledMASSagegroup                          -22.28403    9.76959  -2.281 0.02255082
+#scale(SEX01, center = T)                     13.97826    9.63277   1.451 0.14674771
+#scale(ManipulationCategorie01, center = T)    9.39650    8.56036   1.098 0.27234583
+
+parameters::p_value(modelGRAPH2b)
+
+summary(JDcarnusBROODlargeDATASET2d30bis$CarnusYN_Fnest)
+#  N   Y 
+#  44 281 
+# 13.5% not infected
+# 86.5% infected
+
+
+#model to get intercept and slope for diagonal line
+lm(Petal.Width ~ Petal.Length,
+              data = iris) # int: -0.361, slope = .4158
+
+  geom_abline(slope = .4158,
+              intercept = -0.3631,
+              color="blue")
+dfabline2 <- JDcarnusBROODlargeDATASET2d30bis[,c(18,32)]
+dfabline2$CarnusY <- (dfabline2$TELOaverage)+169.94352+64.95461
+dfabline2$CarnusN <- (dfabline2$TELOaverage)+169.94352
+
+# getting intercept and slope for diagonal line
+lm(Petal.Width ~ Petal.Length,
+              data = iris) # int: -0.361, slope = .4158
+
+ggplot(iris,
+       aes(x=Petal.Length,
+           y=Petal.Width))+
+  geom_point()+
+  geom_abline(slope = .4158,
+              intercept = -0.3631,
+              color="blue")
+
+g0 <- ggplot(JDcarnusBROODlargeDATASET2d30bis,aes(x=TELOaveraged5,y=TELOaverage))+
+  geom_point(aes(x=TELOaveraged5,y=TELOaverage), shape=21, fill="grey", colour="black", size=2.5,data=subset(JDcarnusBROODlargeDATASET2d30bis,CarnusYN_Fnest=="Y"))+
+  geom_point(aes(x=TELOaveraged5,y=TELOaverage), shape=21,size=4, fill="white", data=subset(JDcarnusBROODlargeDATASET2d30bis,CarnusYN_Fnest=="N"))+
+  scale_y_continuous(limits = c(5200, 10000),breaks = c(5200,5600,6000,6400, 6800,7200,7600,8000,8400,8800,9200,9600,10000))+
+  scale_x_continuous(limits = c(5200, 10000),breaks = c(5200,5600,6000,6400, 6800,7200,7600,8000,8400,8800,9200,9600,10000))+
+  labs(x="Telomere length day 5 (bp)",y="Telomere length day 30 (bp)") +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=18,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=18, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.title = element_blank(),
+        strip.text.x = element_text(size = 16))
+g0 +geom_abline(colour="red")+
+  geom_line(data=dfabline2, aes(x=CarnusY,y=TELOaverage), linetype="dashed")+
+  geom_line(data=dfabline2, aes(x=CarnusN,y=TELOaverage), linetype="solid")
+
+##
+ggsave("telo d5 d30 Carnus parallel wo OUTLIER.png", width=28, height=28, unit="cm", dpi=600)
+
+
+
+```
+
+
+# Fig 2b boxplot telo short
+
+```{r telo short Carnus boxplot raw}
+
+# graph is modified with new update on package smplot2
+gSHORT <- ggplot(scaled_dfbisd5,aes(x = CarnusYN_Fnest, y = TELOshort, color = 'white')) +
+     sm_raincloud( sep_level=2, which_side="left",
+                   violin.params = list(alpha = 0.5, color = "transparent", fill="grey"),
+                   #color transparent to remove the border of the violin plots
+                  point.params = list(size = 2.5, shape = 21, color = "grey")) +
+  stat_boxplot(geom ='errorbar', width=0.1, color="black",position = position_dodge(width = 0.9)) + 
+    labs(x="Carnus presence",y="Telomere shortening (bp)") +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(20,0,30,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position="none",
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour="grey"))
+
+gSHORT 
+  
+ggsave("telo short Carnus raw data.png", width=20, height=30, unit="cm", dpi=600)
+
+
+
+
+```
+
+# Fig S2, see emmeans section
+
+```{r}
+JDcarnusBROODlargeDATASET2bis$ManipulationCategorieFACT <- ifelse(JDcarnusBROODlargeDATASET2bis$ManipulationCategorie==1, "enlarged", "reduced")
+
+summary(JDcarnusBROODlargeDATASET2d30bis$mani)
+ggerrorplot(JDcarnusBROODlargeDATASET2bis, x = "CarnusYN_Fnest", y = "TELOaverage", 
+            desc_stat = "mean_sd", 
+            color = "ManipulationCategorieFACT", palette = "jco",
+            position = position_dodge(0.3)     # Adjust the space between bars
+            )
+```
+
+# Fig S3
+
+```{r telo short vs age*sex}
+summary(JDcarnusBROODlargeDATASET2d30bis$TELOshort)  
+
+JDgraphSEXts <- JDcarnusBROODlargeDATASET2d30bis[,c(1,11,16)]
+JDgraphSEXts<-JDgraphSEXts[complete.cases(JDgraphSEXts),] 
+
+
+ggerrorplot(JDgraphSEXts, x = "SEX", y = "TELOshort", 
+            desc_stat = "mean_sd"
+            )
+## unable to see anything
+
+JDgraphSEXtl <- JDcarnusBROODlargeDATASET2bis[,c(1,18,16,20)]
+JDgraphSEXtl <-JDgraphSEXtl[complete.cases(JDgraphSEXtl),] 
+
+
+p <- ggline(JDgraphSEXtl, x = "day", y = "TELOaverage", 
+            add = "mean_se", 
+            color = "SEX", palette = c("#000000", "#999999"),
+            position = position_dodge(0.3) )+    # Adjust the space between bars
+            theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_text(vjust=0.5, size=14, hjust = 1,margin =margin(10,0,10,0)),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))+
+    labs(x="Age",y="Average telomere length (bp)") +
+  scale_x_discrete(labels=c('5','30'))
+p
+
+ggsave("telo short by sex.png", width=22, height=22, unit="cm", dpi=600)
+
+
+
+```
+
+# DO d5 NESTLINGS IN THE ENLARGED HAVE LONGER TELO?
+
+```{r telo d5 vs manip}
+
+t.test(scaled_dfbisd5$TELOaverage~scaled_dfbisd5$ManipulationCatFACT2)
+```
+
+
+```{r variances in enlarged vs reduced in TL}
+leveneTest(TELOaverage ~ ManipulationCatFACT2, data = scaled_dfbisd5)
+#        Df F value Pr(>F)
+#group   1  0.0725  0.788
+#      323 
+
+leveneTest(TELOaverage ~ ManipulationCatFACT2, data = scaled_dfbis22)
+
+scaled_dfbisd30 <- scaled_dfbis22 %>% 
+  filter(day =="30") %>% 
+  droplevels()
+
+leveneTest(TELOaverage ~ ManipulationCatFACT2, data = scaled_dfbisd30)
+```
+
+
+
+
+# OLD FIGURE 2 SCALED MASS BROOD AGE
+
+```{r graph telo shortening with brood and mass}
+
+## converting scale mass to plot 3 regression lines (1 sd below the mean, mean, 1 sd above the mean)
+
+# need to do it separately for age groups
+scaled_dfD5 <- scaled_df %>% 
+  filter(day == "5")%>% 
+  droplevels()
+
+scaled_dfD30 <- scaled_df %>% 
+  filter(day == "30")%>% 
+  droplevels()
+
+
+x1 <- scaled_dfD5$scaledmass_agemanip
+scaled_dfD5$mass_3group <-
+  case_when(x1 > mean(x1)+sd(x1) ~ "above",
+            x1 < mean(x1)+sd(x1) & x1 > mean(x1)-sd(x1) ~ "mean",
+            x1 < mean(x1)-sd(x1) ~ "below")
+head(scaled_dfD5$mass_3group)
+scaled_dfD5$mass_3group <- as.factor(scaled_dfD5$mass_3group)
+summary(scaled_dfD5$mass_3group)
+#above below  mean 
+#   50    56   220 
+colnames(scaled_dfD5)[colnames(scaled_dfD5)=="mass_3group"] <- "mass_3groupD5"
+scaled_dfD5 <- scaled_dfD5[,c(1,3,20,33)]
+
+x2 <- scaled_dfD30$scaledmass_agemanip
+scaled_dfD30$mass_3group <-
+  case_when(x2 > mean(x2)+sd(x2) ~ "above",
+            x2 < mean(x2)+sd(x2) & x2 > mean(x2)-sd(x2) ~ "mean",
+            x2 < mean(x2)-sd(x2) ~ "below")
+head(scaled_dfD30$mass_3group)
+scaled_dfD30$mass_3group <- as.factor(scaled_dfD30$mass_3group)
+summary(scaled_dfD30$mass_3group)
+#above below  mean 
+#   47    48   231 
+colnames(scaled_dfD30)[colnames(scaled_dfD30)=="mass_3group"] <- "mass_3groupD30"
+scaled_dfD30 <- scaled_dfD30[,c(1,3,20,33)]
+
+scaled_df2 <- join_all(list(scaled_df,scaled_dfD5,scaled_dfD30), by=c("Chick_ID","Fnest","day"), type='left')
+scaled_df2$mass_3group <- ifelse(is.na(scaled_df2$mass_3groupD5), scaled_df2$mass_3groupD30, scaled_df2$mass_3groupD5)
+which(is.na(scaled_df2$mass_3group))
+scaled_df2$mass_3group <- as.factor(scaled_df2$mass_3group)
+levels(scaled_df2$mass_3group)[levels(scaled_df2$mass_3group)=="3"] <- "mean"
+levels(scaled_df2$mass_3group)[levels(scaled_df2$mass_3group)=="2"] <- "below"
+levels(scaled_df2$mass_3group)[levels(scaled_df2$mass_3group)=="1"] <- "above"
+str(scaled_df2)
+scaled_df <- scaled_df2[,-c(34,35)]
+summary(scaled_df$mass_3group)
+#above below  mean 
+#   97   104   451 
+
+
+
+#first summarise the data, needs summary function to be loaded, see top
+dfgraphsba <- summarySEwithin(scaled_df,measurevar="TELOaverage",  withinvars=c("day", "ManipulationCategorie", "mass_3group"),
+ idvar="Chick_ID", na.rm=FALSE, conf.interval=.95)
+dfgraphsba
+
+
+levels(dfgraphsba$mass_3group)[levels(dfgraphsba$mass_3group)=="above"] <- "+1SD"
+levels(dfgraphsba$mass_3group)[levels(dfgraphsba$mass_3group)=="below"] <- "-1SD"
+levels(dfgraphsba$mass_3group)[levels(dfgraphsba$mass_3group)=="mean"] <- "Mean"
+
+dfgraphsba$ManipulationCategorieF <- ifelse(dfgraphsba$ManipulationCategorie=="-1", "reduced", "enlarged")
+
+dfgraphsba$ManipulationCategorieF <- factor(dfgraphsba$ManipulationCategorieF, levels = c("reduced", "enlarged"))
+
+pd <- position_dodge(0.4)
+
+p<-ggplot(dfgraphsba, aes(x=day, y=TELOaverage,group=mass_3group)) +
+  facet_wrap(~ManipulationCategorieF)+
+  geom_line(aes(group=mass_3group, linetype=mass_3group), position=pd) +
+  scale_linetype_manual(values=c(2,3,1)) +  
+    geom_errorbar(width=.1, aes(ymin=TELOaverage-ci, ymax=TELOaverage+ci), position=pd) +
+    geom_point(shape=21, size=3, fill="white",position=pd) +
+  labs(x="Age (days)",y="Average telomere length (bp)") +
+  scale_y_continuous(limits = c(6560, 7420), breaks = seq(6550, 7400, by = 200)) +   
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, vjust=0.3),
+        axis.text.x=element_text(size=14,margin =margin(20,0,30,0)),
+        axis.text.y=element_text(size=14, margin =margin(0,20,0,30)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_blank(),
+        legend.text=element_text(size=14),
+        panel.background = element_blank(),
+        legend.key.size = unit(0.5, "in"), #makes lines bigger in legend
+        strip.text = element_text(size = 14)) #this makes font size in facet wrap bigger
+p
+
+
+ggsave("telo short w mass and brood manip raw.png", width=20, height=25, unit="cm", dpi=600)
+
+
+
+```
+
+
+
+
+
+## OTHER GRAPHS
+
+
+#density plot for telomere shortening
+
+
+```{r density plot telo short vs Carnus}
+JDcarnusBROODlargeDATASET2short <- subset(JDcarnusBROODlargeDATASET2, day=="5")
+
+p<-ggplot(JDcarnusBROODlargeDATASET2short, aes(x=TELOshort, color=CarnusYN_Fnest)) +
+  geom_density()+ scale_fill_grey() + theme_classic()+
+  labs(x="Telomere shortening(bp)", y = "Density")+
+  theme_classic()
+p
+```
+
+
+```{r telo short Carnus boxplot predicted and raw}
+
+
+modelGRAPH <- lmer(TELOshort~scale(CarnusYN_Fnest01, center=T)+scaledMASSagegroup+scale(SEX01, center=T)+scale(ManipulationCategorie01, center=T)+(1|YEAR)+(1|Colony)+(1|Fnest), data=JDcarnusBROODlargeDATASET2short, control=my.control)
+#singular fit
+
+JDgraph <- JDcarnusBROODlargeDATASET2short[,c(1,9,8,3,30,5,33,31,10,29,11)]
+JDgraph<-JDgraph[complete.cases(JDgraph),] 
+
+mSHORT2g <- blmer(formula = TELOshort~scale(CarnusYN_Fnest01, center=T)+scaledMASSagegroup+scale(SEX01, center=T)+scale(ManipulationCategorie01, center=T)+(1|YEAR)+(1|Colony)+(1|Fnest),
+                 data=JDgraph,
+                        control=my.control,
+                        cov.prior = invwishart)
+
+
+JDgraph$pred<- predict(mSHORT2g,newdata=JDgraph, type="response")
+range(JDgraph$pred) ## 80.50947 369.53052
+range(JDgraph$TELOshort) ## -373.6573 1357.4102
+
+
+gSHORT <- ggplot(data = JDgraph, mapping = aes(x=CarnusYN_Fnest,y=TELOshort)) +
+  geom_point(aes(x=CarnusYN_Fnest,y=TELOshort), shape=21, fill="grey", colour="black")+
+  
+  theme_bw() +
+  scale_y_continuous(limits=c(-350, 750)) +#to remove the border of the violin plots
+  annotate("text", x=1, y=-350, label="N", size=4) +
+  annotate("text", x=2, y=-350, label="Y", size=4) +
+ 
+gSHORT+sm_raincloud(JDgraph,x=CarnusYN_Fnest,y=pred,boxplot_alpha = 0.5, color = 'white', shape = 21)+
+  scale_fill_manual(values = c("white", "white"))+
+  scale_color_manual(values = rep('transparent',4)) 
+  
+
+
+## see https://rpubs.com/jenrichmond/W6LL
+source("R_rainclouds.R") # this does not work so just run the script "R_rainclouds.R"
+
+
+JDgraph2<-JDgraph[!(JDgraph$TELOshort>800),]
+
+ 
+   
+   
+gSHORT <- JDgraph2 %>% ggplot(aes(x=CarnusYN_Fnest,y=TELOshort)) +
+  geom_flat_violin(position = position_nudge(x = .2, y = 0),adjust =2, alpha = 0.5) +
+  geom_point(aes(x=CarnusYN_Fnest,y=TELOshort), position = position_jitter(width = .1),shape=21, fill="grey", colour="black", size=2.5,data=subset(JDgraph2,CarnusYN_Fnest=="Y"))+ #colour for outer line and fill for inside
+  geom_point(aes(x=CarnusYN_Fnest,y=TELOshort), position = position_jitter(width = .1),shape=21,size=4, fill="white", data=subset(JDgraph2,CarnusYN_Fnest=="N"))+
+  scale_x_discrete( expand = c(0.06, 0.06)) + #expand takes the space between axis and plot out
+  scale_y_continuous(expand = c(0.06, 0.06)) +
+   geom_boxplot(aes(x = CarnusYN_Fnest, y = pred),outlier.shape = NA, alpha = .5, width = .1, colour = "black")+
+   theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position="none",
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))+
+    labs(x="Carnus presence",y="Telomere shortening (bp)")
+gSHORT
+
+
+ggsave("telo short Carnus boxplot violin and points pred and raw.png", width=25, height=20, unit="cm", dpi=600)
+
+
+
+```
+
+
+
+
+#telomere length vs carnus boxplots
+
+```{r boxplot with raw data}
+
+
+
+g0 <- ggplot(JDcarnusBROODlargeDATASET2,aes(x=interaction(day,CarnusYN_Fnest),y=TELOaverage))+
+    geom_boxplot(alpha = 0.5, aes(fill=day),notch = 'TRUE')+
+    geom_line(aes(group=interaction(Chick_ID,CarnusYN_Fnest)), alpha=0.5, colour="darkgrey")+
+    labs(x="Carnus presence",y="Average telomere length") +
+  theme_bw() +
+  annotate("text", x=1.5, y=5350, label="N", size=4) +
+  annotate("text", x=3.5, y=5350, label="Y", size=4) +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))
+g0
+##
+ggsave("boxplotTELOcarnus.png", width=42, height=22, unit="cm", dpi=600)
+##
+##
+##
+```
+
+
+
+```{r violin plot line joining does not work}
+
+## see https://smin95.github.io/dataviz/manual-and-examples-of-smplot.html
+
+
+newdata<-subset(JDcarnusBROODlargeDATASET2, select=c("CarnusYN_Fnest","day","TELOaverage"))
+meandf <- newdata %>% 
+  group_by(day,CarnusYN_Fnest) %>% 
+  summarize(average = mean(TELOaverage)) %>%
+  ungroup()
+
+
+g1 <- ggplot(JDcarnusBROODlargeDATASET2,aes(x=interaction(day,CarnusYN_Fnest),y=TELOaverage))+
+    sm_violin()+
+    labs(x="Carnus presence",y="Average telomere length") +
+  theme_bw() +
+  annotate("text", x=1.5, y=5350, label="N", size=4) +
+  annotate("text", x=3.5, y=5350, label="Y", size=4) +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))
+g1
+
+##code below does not work
+geom_line(meandf, aes(x=interaction(day,CarnusYN_Fnest), y=average), colour="black", size=1.4)
+
+
+```
+
+
+```{r raincloud}
+
+g2 <- sm_raincloud(JDcarnusBROODlargeDATASET2,x=interaction(day,CarnusYN_Fnest),y=TELOaverage,boxplot_alpha = 0.5, color = 'white', shape = 21)+
+    labs(x="Carnus presence",y="Average telomere length") +
+  theme_bw() +
+  scale_fill_manual(values = c("blue", "orange","blue", "orange"))+
+  scale_color_manual(values = rep('transparent',4)) + #to remove the border of the violin plots
+  annotate("text", x=1.5, y=5350, label="N", size=4) +
+  annotate("text", x=3.5, y=5350, label="Y", size=4) +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position="none",
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))
+g2
+
+
+
+```
+
+
+#telomere length vs carnus points and lines
+
+
+```{r points and slopes}
+
+g4 <- ggplot(JDcarnusBROODlargeDATASET2,aes(x=interaction(day,CarnusYN_Fnest),y=TELOaverage, group=Chick_ID, fill=day))+
+    sm_slope(labels=c("Day 5", "Day 30"),fill = sm_color('blue'))+
+    labs(x="Carnus presence",y="Average telomere length") +
+  annotate("text", x=1.5, y=9950, label="N", size=4) +
+  annotate("text", x=3.5, y=9950, label="Y", size=4) +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=15),
+        axis.title.y = element_text(size=15, vjust=0.3),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=10, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        strip.text.x = element_text(size = 18))
+g4
+
+
+
+```
+
+
+
